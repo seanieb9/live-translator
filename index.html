@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live KO ⇄ EN Translator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #0f172a; color: #e2e8f0; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; padding: 24px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .sub { color: #94a3b8; font-size: 0.85rem; margin-bottom: 20px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  select, button {
+    background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+    border-radius: 10px; padding: 10px 16px; font-size: 1rem; cursor: pointer;
+  }
+  button:hover { background: #334155; }
+  #startBtn { background: #2563eb; border: none; font-weight: 600; }
+  #startBtn.listening { background: #dc2626; }
+  #clearBtn { color: #f87171; }
+  #status { margin: 14px 0; font-size: 0.9rem; color: #94a3b8; min-height: 1.2em; }
+  #status.on { color: #4ade80; }
+  #interim { color: #facc15; font-style: italic; min-height: 1.4em; margin-bottom: 10px; }
+  #log { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 12px; }
+  .entry {
+    background: #1e293b; border-radius: 12px; padding: 14px 16px;
+    border-left: 4px solid #2563eb;
+  }
+  .entry .orig { font-size: 1.05rem; margin-bottom: 6px; }
+  .entry .trans { color: #93c5fd; font-size: 1.05rem; }
+  .entry .meta { color: #64748b; font-size: 0.75rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>🎤 Live Translator <span style="color:#93c5fd">한국어 ⇄ English</span></h1>
+  <div class="sub">Speak — read the translation. No audio output.</div>
+
+  <div class="controls">
+    <label style="color:#94a3b8;font-size:0.9rem">I speak:</label>
+    <select id="langSelect">
+      <option value="ko-KR|en|🇰🇷 Korean → English">🇰🇷 Korean → English</option>
+      <option value="en-US|ko|🇺🇸 English → Korean">🇺🇸 English → Korean</option>
+    </select>
+    <button id="startBtn">▶ Start</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+
+  <div id="status">Idle — press Start and allow the microphone.</div>
+  <div id="interim"></div>
+  <div id="log"></div>
+
+<script>
+const startBtn = document.getElementById('startBtn');
+const clearBtn = document.getElementById('clearBtn');
+const langSelect = document.getElementById('langSelect');
+const statusEl = document.getElementById('status');
+const interimEl = document.getElementById('interim');
+const logEl = document.getElementById('log');
+
+let rec = null, listening = false, restarting = false;
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// Mic access requires a secure context (HTTPS or localhost)
+if (!window.isSecureContext) {
+  statusEl.textContent = "⚠️ Mic needs HTTPS (or localhost). Try: cloudflared tunnel --url http://localhost:8000";
+} else if (isIOS) {
+  statusEl.textContent = "iPad detected ✓ — use this page in Safari (not a home-screen icon), keep the screen on.";
+}
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) {
+  statusEl.textContent = "⚠️ This browser doesn't support Speech Recognition. Use Chrome or Edge.";
+}
+
+async function translate(text, tl) {
+  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
+    + tl + "&dt=t&q=" + encodeURIComponent(text);
+  const res = await fetch(url);
+  const data = await res.json();
+  return data[0].map(seg => seg[0]).join("");
+}
+
+function setStatus(msg, on) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('on', !!on);
+}
+
+function addEntry(orig, trans, dir) {
+  const div = document.createElement('div');
+  div.className = 'entry';
+  div.innerHTML =
+    '<div class="orig"></div>' +
+    '<div class="trans"></div>' +
+    '<div class="meta">' + dir + ' · ' + new Date().toLocaleTimeString() + '</div>';
+  div.querySelector('.orig').textContent = orig;
+  div.querySelector('.trans').textContent = trans;
+  logEl.prepend(div);
+}
+
+function start() {
+  const [srLang, tl, dir] = langSelect.value.split('|');
+  rec = new SR();
+  rec.lang = srLang;
+  rec.continuous = !isIOS;  // continuous is unreliable on iOS; we auto-restart instead
+  rec.interimResults = true;
+
+  rec.onstart = () => {
+    listening = true;
+    startBtn.textContent = '⏹ Stop';
+    startBtn.classList.add('listening');
+    setStatus('● Listening — ' + dir, true);
+  };
+
+  rec.onresult = async (e) => {
+    let interim = '', final = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) final += t;
+      else interim += t;
+    }
+    interimEl.textContent = interim;
+    if (final.trim()) {
+      interimEl.textContent = '';
+      try {
+        const translated = await translate(final.trim(), tl);
+        addEntry(final.trim(), translated, dir);
+      } catch {
+        addEntry(final.trim(), '(translation failed)', dir);
+      }
+    }
+  };
+
+  rec.onerror = (e) => {
+    if (e.error === 'not-allowed') {
+      setStatus('⚠️ Microphone blocked — allow mic access and restart.');
+      stop();
+    } else if (e.error === 'no-speech') {
+      setStatus('● Listening (no speech detected)...', true);
+    } else if (e.error !== 'aborted') {
+      setStatus('⚠️ Error: ' + e.error);
+    }
+  };
+
+  rec.onend = () => {
+    if (!listening || restarting) return;
+    restarting = true;
+    setTimeout(() => {
+      restarting = false;
+      if (listening) { try { rec.start(); } catch(e) {} }
+    }, 250);  // iOS needs a beat between restarts
+  };
+  rec.start();
+}
+
+function stop() {
+  listening = false;
+  restarting = false;
+  if (rec) rec.stop();
+  startBtn.textContent = '▶ Start';
+  startBtn.classList.remove('listening');
+  setStatus('Stopped.');
+  interimEl.textContent = '';
+}
+
+startBtn.onclick = () => listening ? stop() : start();
+clearBtn.onclick = () => { logEl.innerHTML = ''; };
+langSelect.onchange = () => { if (listening) { stop(); start(); } };
+</script>
+</body>
+</html>
