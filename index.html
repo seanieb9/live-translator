@@ -22,16 +22,27 @@
   #startBtn { background: #2563eb; border: none; font-weight: 600; }
   #startBtn.listening { background: #dc2626; }
   #clearBtn { color: #f87171; }
-  #status { margin: 14px 0; font-size: 0.9rem; color: #94a3b8; min-height: 1.2em; }
+  #status { margin: 14px 0 6px; font-size: 0.9rem; color: #94a3b8; min-height: 1.2em; }
   #status.on { color: #4ade80; }
+  #status.warn { color: #fbbf24; }
+  #engine {
+    font-size: 0.75rem; color: #64748b; margin-bottom: 12px; min-height: 1.1em;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  #engine .dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; }
+  #engine.local .dot { background: #4ade80; }
+  #engine.net .dot { background: #fbbf24; }
   #interim { color: #facc15; font-style: italic; min-height: 1.4em; margin-bottom: 10px; }
   #log { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 12px; }
   .entry {
     background: #1e293b; border-radius: 12px; padding: 14px 16px;
     border-left: 4px solid #2563eb;
   }
+  .entry.pending { border-left-color: #475569; }
+  .entry.failed { border-left-color: #dc2626; }
   .entry .orig { font-size: 1.05rem; margin-bottom: 6px; }
   .entry .trans { color: #93c5fd; font-size: 1.05rem; }
+  .entry .trans.waiting { color: #64748b; font-style: italic; }
   .entry .meta { color: #64748b; font-size: 0.75rem; margin-top: 8px; }
 </style>
 </head>
@@ -42,14 +53,15 @@
   <div class="controls">
     <label style="color:#94a3b8;font-size:0.9rem">I speak:</label>
     <select id="langSelect">
-      <option value="ko-KR|en|🇰🇷 Korean → English">🇰🇷 Korean → English</option>
-      <option value="en-US|ko|🇺🇸 English → Korean">🇺🇸 English → Korean</option>
+      <option value="ko-KR|ko|en|🇰🇷 Korean → English">🇰🇷 Korean → English</option>
+      <option value="en-US|en|ko|🇺🇸 English → Korean">🇺🇸 English → Korean</option>
     </select>
     <button id="startBtn">▶ Start</button>
     <button id="clearBtn">Clear</button>
   </div>
 
   <div id="status">Idle — press Start and allow the microphone.</div>
+  <div id="engine"><span class="dot"></span><span id="engineText">Checking translation engine…</span></div>
   <div id="interim"></div>
   <div id="log"></div>
 
@@ -58,6 +70,8 @@ const startBtn = document.getElementById('startBtn');
 const clearBtn = document.getElementById('clearBtn');
 const langSelect = document.getElementById('langSelect');
 const statusEl = document.getElementById('status');
+const engineEl = document.getElementById('engine');
+const engineText = document.getElementById('engineText');
 const interimEl = document.getElementById('interim');
 const logEl = document.getElementById('log');
 
@@ -67,43 +81,225 @@ const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
 
 // Mic access requires a secure context (HTTPS or localhost)
 if (!window.isSecureContext) {
-  statusEl.textContent = "⚠️ Mic needs HTTPS (or localhost). Try: cloudflared tunnel --url http://localhost:8000";
+  setStatus("⚠️ Mic needs HTTPS (or localhost). Try: cloudflared tunnel --url http://localhost:8000", false, true);
 } else if (isIOS) {
-  statusEl.textContent = "iPad detected ✓ — use this page in Safari (not a home-screen icon), keep the screen on.";
+  setStatus("iPad detected ✓ — use this page in Safari (not a home-screen icon), keep the screen on.");
 }
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 if (!SR) {
-  statusEl.textContent = "⚠️ This browser doesn't support Speech Recognition. Use Chrome or Edge.";
+  setStatus("⚠️ This browser doesn't support Speech Recognition. Use Chrome or Edge.", false, true);
 }
 
-async function translate(text, tl) {
-  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
-    + tl + "&dt=t&q=" + encodeURIComponent(text);
-  const res = await fetch(url);
-  const data = await res.json();
-  return data[0].map(seg => seg[0]).join("");
+/* ---------------------------------------------------------------
+   Translation engines
+   1. Chrome's built-in on-device Translator API (no network, no rate limit)
+   2. Fallback: the unofficial translate.googleapis.com endpoint, which is
+      throttled per IP — so it is cached, serialised and backed off.
+   --------------------------------------------------------------- */
+
+const HAS_LOCAL = typeof self !== 'undefined' && 'Translator' in self;
+const localTranslators = new Map();   // "ko>en" -> Promise<Translator>
+
+function setEngine(mode, text) {
+  engineEl.className = mode || '';
+  engineText.textContent = text;
 }
 
-function setStatus(msg, on) {
+// Report what we will use, before anyone presses Start.
+(async () => {
+  if (!HAS_LOCAL) {
+    setEngine('net', 'Network translation (shared endpoint — may rate-limit). Chrome 138+ translates on-device.');
+    return;
+  }
+  try {
+    const a = await Translator.availability({ sourceLanguage: 'ko', targetLanguage: 'en' });
+    if (a === 'available') setEngine('local', 'On-device translation ready — no network, no rate limits.');
+    else if (a === 'downloadable' || a === 'downloading') setEngine('local', 'On-device translation available — the language pack downloads on first use.');
+    else setEngine('net', 'On-device pack unavailable for ko/en — using the network endpoint.');
+  } catch {
+    setEngine('net', 'Network translation (shared endpoint — may rate-limit).');
+  }
+})();
+
+// Create (and cache) an on-device translator. Called from the Start click so
+// that a first-use model download has the user activation it requires.
+function getLocalTranslator(src, tgt) {
+  if (!HAS_LOCAL) return null;
+  const key = src + '>' + tgt;
+  if (!localTranslators.has(key)) {
+    const p = (async () => {
+      const a = await Translator.availability({ sourceLanguage: src, targetLanguage: tgt });
+      if (a === 'unavailable') throw new Error('pair unavailable');
+      return await Translator.create({
+        sourceLanguage: src,
+        targetLanguage: tgt,
+        monitor(m) {
+          m.addEventListener('downloadprogress', (e) => {
+            const pct = Math.round((e.loaded || 0) * 100);
+            setEngine('local', 'Downloading on-device language pack… ' + pct + '%');
+          });
+        }
+      });
+    })();
+    p.then(
+      () => setEngine('local', 'On-device translation — no network, no rate limits.'),
+      () => { localTranslators.delete(key); }
+    );
+    localTranslators.set(key, p);
+  }
+  return localTranslators.get(key);
+}
+
+/* ---- Cache: identical phrases never hit the network twice ---- */
+const CACHE_MAX = 500;
+const cache = new Map();
+function cacheGet(k) {
+  if (!cache.has(k)) return undefined;
+  const v = cache.get(k);
+  cache.delete(k); cache.set(k, v);   // refresh LRU position
+  return v;
+}
+function cacheSet(k, v) {
+  cache.set(k, v);
+  if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+}
+
+/* ---- Network fallback with backoff on 429 / failure ---- */
+const MAX_ATTEMPTS = 5;
+let cooldownUntil = 0;   // epoch ms; set when the endpoint throttles us
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function netTranslate(text, tl, onRetry) {
+  let delay = 1000;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const wait = cooldownUntil - Date.now();
+    if (wait > 0) await sleep(wait);
+    try {
+      const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl='
+        + encodeURIComponent(tl) + '&dt=t&q=' + encodeURIComponent(text);
+      const res = await fetch(url);
+      if (res.status === 429 || res.status === 403 || res.status >= 500) throw new Error('http ' + res.status);
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      cooldownUntil = 0;
+      return data[0].map(seg => seg[0]).join('');
+    } catch (err) {
+      if (attempt === MAX_ATTEMPTS) throw err;
+      cooldownUntil = Date.now() + delay;
+      const secs = Math.round(delay / 1000);
+      if (onRetry) onRetry(secs, attempt);
+      setStatus('⏳ Translation throttled — retrying in ' + secs + 's…', false, true);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30000);
+    }
+  }
+}
+
+/* ---- One translation request at a time, cache first ---- */
+let queue = Promise.resolve();
+
+function translate(text, src, tgt, onRetry) {
+  const key = tgt + '|' + text;
+  const hit = cacheGet(key);
+  if (hit !== undefined) return Promise.resolve({ text: hit, cached: true });
+
+  const run = async () => {
+    const lt = getLocalTranslator(src, tgt);
+    if (lt) {
+      try {
+        const t = await lt;
+        const out = await t.translate(text);
+        cacheSet(key, out);
+        return { text: out, local: true };
+      } catch { /* fall through to the network */ }
+    }
+    const out = await netTranslate(text, tgt, onRetry);
+    cacheSet(key, out);
+    return { text: out, local: false };
+  };
+
+  // Chain so only one request is ever in flight.
+  const result = queue.then(run, run);
+  queue = result.catch(() => {});
+  return result;
+}
+
+/* ---------------------------------------------------------------
+   Speech handling
+   --------------------------------------------------------------- */
+
+function setStatus(msg, on, warn) {
   statusEl.textContent = msg;
   statusEl.classList.toggle('on', !!on);
+  statusEl.classList.toggle('warn', !!warn);
 }
 
-function addEntry(orig, trans, dir) {
+function addEntry(orig, dir) {
   const div = document.createElement('div');
-  div.className = 'entry';
+  div.className = 'entry pending';
   div.innerHTML =
     '<div class="orig"></div>' +
-    '<div class="trans"></div>' +
+    '<div class="trans waiting">translating…</div>' +
     '<div class="meta">' + dir + ' · ' + new Date().toLocaleTimeString() + '</div>';
   div.querySelector('.orig').textContent = orig;
-  div.querySelector('.trans').textContent = trans;
   logEl.prepend(div);
+  return {
+    resolve(text, note) {
+      div.className = 'entry';
+      const t = div.querySelector('.trans');
+      t.className = 'trans';
+      t.textContent = text;
+      if (note) div.querySelector('.meta').textContent += ' · ' + note;
+    },
+    waiting(text) {
+      div.querySelector('.trans').textContent = text;
+    },
+    fail(text) {
+      div.className = 'entry failed';
+      const t = div.querySelector('.trans');
+      t.className = 'trans';
+      t.textContent = text;
+    }
+  };
+}
+
+/* ---- Merge short fragments so bursts become one request ---- */
+const MERGE_MIN_CHARS = 10;    // flush immediately once the buffer is this long
+const MERGE_DEBOUNCE = 600;    // ms of silence before flushing a short fragment
+let pending = '';
+let mergeTimer = null;
+
+function queueFinal(text, src, tgt, dir) {
+  pending = (pending ? pending + ' ' : '') + text;
+  clearTimeout(mergeTimer);
+  if (pending.length >= MERGE_MIN_CHARS) flushPending(src, tgt, dir);
+  else mergeTimer = setTimeout(() => flushPending(src, tgt, dir), MERGE_DEBOUNCE);
+}
+
+function flushPending(src, tgt, dir) {
+  clearTimeout(mergeTimer);
+  const text = pending.trim();
+  pending = '';
+  if (!text) return;
+
+  const entry = addEntry(text, dir);
+  translate(text, src, tgt, (secs) => entry.waiting('throttled — retrying in ' + secs + 's…'))
+    .then(({ text: out, cached, local }) => {
+      entry.resolve(out, cached ? 'cached' : (local ? 'on-device' : null));
+      if (listening) setStatus('● Listening — ' + dir, true);
+    })
+    .catch(() => {
+      entry.fail('(translation failed — the shared endpoint is rate-limiting this network)');
+      setStatus('⚠️ Translation unavailable — the shared endpoint is throttling. Try again shortly.', false, true);
+    });
 }
 
 function start() {
-  const [srLang, tl, dir] = langSelect.value.split('|');
+  const [srLang, src, tgt, dir] = langSelect.value.split('|');
+  getLocalTranslator(src, tgt);   // warm up / trigger download under user activation
+
   rec = new SR();
   rec.lang = srLang;
   rec.continuous = !isIOS;  // continuous is unreliable on iOS; we auto-restart instead
@@ -116,7 +312,7 @@ function start() {
     setStatus('● Listening — ' + dir, true);
   };
 
-  rec.onresult = async (e) => {
+  rec.onresult = (e) => {
     let interim = '', final = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const t = e.results[i][0].transcript;
@@ -126,23 +322,18 @@ function start() {
     interimEl.textContent = interim;
     if (final.trim()) {
       interimEl.textContent = '';
-      try {
-        const translated = await translate(final.trim(), tl);
-        addEntry(final.trim(), translated, dir);
-      } catch {
-        addEntry(final.trim(), '(translation failed)', dir);
-      }
+      queueFinal(final.trim(), src, tgt, dir);
     }
   };
 
   rec.onerror = (e) => {
     if (e.error === 'not-allowed') {
-      setStatus('⚠️ Microphone blocked — allow mic access and restart.');
+      setStatus('⚠️ Microphone blocked — allow mic access and restart.', false, true);
       stop();
     } else if (e.error === 'no-speech') {
       setStatus('● Listening (no speech detected)...', true);
     } else if (e.error !== 'aborted') {
-      setStatus('⚠️ Error: ' + e.error);
+      setStatus('⚠️ Error: ' + e.error, false, true);
     }
   };
 
@@ -158,6 +349,8 @@ function start() {
 }
 
 function stop() {
+  const [, src, tgt, dir] = langSelect.value.split('|');
+  flushPending(src, tgt, dir);   // don't lose a half-merged fragment
   listening = false;
   restarting = false;
   if (rec) rec.stop();
